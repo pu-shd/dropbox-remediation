@@ -1,0 +1,351 @@
+<#
+.SYNOPSIS
+    Intune Remediation - DETECTION script for the Dropbox session watchdog.
+
+.DESCRIPTION
+    Runs as SYSTEM, 64-bit, on the Intune schedule (hourly is recommended).
+
+    This script deliberately does NOT try to detect whether Dropbox itself is running.
+    Dropbox is a per-user interactive application: a SYSTEM-context script sees neither
+    the user's %LOCALAPPDATA% nor their desktop session, so any verdict it reached about
+    "is Dropbox running" would be wrong on multi-user devices and unactionable on all of
+    them (Intune can only re-check hourly).
+
+    Instead it verifies that the per-session watchdog is installed and healthy:
+      1. The payload script is present and matches the expected SHA-256.
+      2. The runtime config matches the expected payload version.
+      3. The scheduled task exists, is enabled, is scoped to BUILTIN\Users, and has the
+         expected action and triggers.
+      4. Every interactive session that has been logged on long enough has a fresh
+         watchdog heartbeat (catches a wedged or crashed watchdog).
+
+    The Application event-log source is created best-effort by the remediation and is
+    deliberately NOT a compliance gate: failing on it would loop remediation hourly on
+    devices where source creation is blocked, without improving Dropbox availability.
+
+    Exit 0 = compliant (no remediation). Exit 1 = run the remediation script.
+
+.NOTES
+    Windows PowerShell 5.1 compatible. Output is kept under Intune's 2048-character limit.
+#>
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+@@SHARED_CONTRACT@@
+
+#--------------------------------------------------------------------------------------
+# Windows API wrappers (mockable in the test suite)
+#--------------------------------------------------------------------------------------
+
+function Get-WatchdogScheduledTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$TaskPath
+    )
+    try {
+        return Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Get-InteractiveUserProfile {
+    <#
+        Returns one object per interactive desktop session: the owning SID, the profile
+        directory, and how long explorer.exe has been running. Uses SIDs throughout so it
+        is language-independent and works for Entra ID, AD and local accounts alike.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $results = New-Object System.Collections.Generic.List[object]
+    try {
+        $explorers = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($proc in $explorers) {
+        try {
+            $ownerSid = (Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop).Sid
+            if ([string]::IsNullOrWhiteSpace($ownerSid)) { continue }
+            if (-not $seen.Add($ownerSid)) { continue }
+
+            $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ownerSid"
+            if (-not (Test-Path -LiteralPath $profileKey)) { continue }
+            $profilePath = (Get-ItemProperty -LiteralPath $profileKey -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath
+            if ([string]::IsNullOrWhiteSpace($profilePath)) { continue }
+
+            $startTime = $null
+            try { $startTime = $proc.CreationDate } catch { $startTime = $null }
+
+            $results.Add([pscustomobject]@{
+                Sid             = $ownerSid
+                ProfilePath     = [Environment]::ExpandEnvironmentVariables($profilePath)
+                SessionStartUtc = $startTime
+            })
+        } catch {
+            continue
+        }
+    }
+    return @($results.ToArray())
+}
+
+#--------------------------------------------------------------------------------------
+# Individual compliance checks. Each returns an array of human-readable reasons;
+# an empty array means that check passed.
+#--------------------------------------------------------------------------------------
+
+function Test-PayloadInstalled {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $reasons = @()
+    if (-not (Test-Path -LiteralPath $Contract.PayloadPath -PathType Leaf)) {
+        return @('watchdog payload missing')
+    }
+
+    try {
+        $hash = (Get-FileHash -LiteralPath $Contract.PayloadPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($hash -ne $Contract.PayloadSha256) {
+            $reasons += ('payload hash mismatch (found {0}, expected {1})' -f
+                $hash.Substring(0, [Math]::Min(12, $hash.Length)),
+                $Contract.PayloadSha256.Substring(0, [Math]::Min(12, $Contract.PayloadSha256.Length)))
+        }
+    } catch {
+        $reasons += ('payload hash unreadable: {0}' -f $_.Exception.Message)
+    }
+    return $reasons
+}
+
+function Test-ConfigCurrent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    if (-not (Test-Path -LiteralPath $Contract.ConfigPath -PathType Leaf)) {
+        return @('runtime config missing')
+    }
+    try {
+        $config = Get-Content -LiteralPath $Contract.ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $names = @($config.PSObject.Properties.Name)
+        if (-not ($names -contains 'PayloadVersion')) { return @('runtime config has no PayloadVersion') }
+        if ([string]$config.PayloadVersion -ne [string]$Contract.PayloadVersion) {
+            return @('payload version {0} installed, {1} expected' -f $config.PayloadVersion, $Contract.PayloadVersion)
+        }
+        if (($names -contains 'ContractVersion') -and
+            ([string]$config.ContractVersion -ne [string]$Contract.ContractVersion)) {
+            return @('contract version {0} installed, {1} expected' -f $config.ContractVersion, $Contract.ContractVersion)
+        }
+    } catch {
+        return @('runtime config unreadable: {0}' -f $_.Exception.Message)
+    }
+    return @()
+}
+
+function Test-WatchdogTaskHealthy {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $task = Get-WatchdogScheduledTask -TaskName $Contract.TaskName -TaskPath $Contract.TaskPath
+    if (-not $task) { return @('scheduled task missing') }
+
+    $reasons = @()
+
+    try {
+        if ($task.State -eq 'Disabled') { $reasons += 'scheduled task disabled' }
+    } catch {
+        $reasons += 'scheduled task state unreadable'
+    }
+
+    try {
+        if (-not (Test-GroupIdMatch -ActualGroupId $task.Principal.GroupId -ExpectedSid $Contract.UsersGroupSid)) {
+            $reasons += ('task principal is "{0}", expected the Users group' -f $task.Principal.GroupId)
+        }
+    } catch {
+        $reasons += 'task principal unreadable (task is not scoped to all users)'
+    }
+
+    try {
+        $expected = @(Get-ExpectedTaskAction -Contract $Contract)
+        $matched = $false
+        foreach ($action in @($task.Actions)) {
+            $execute = ''
+            $argument = ''
+            if ($action.PSObject.Properties.Name -contains 'Execute')   { $execute = [string]$action.Execute }
+            if ($action.PSObject.Properties.Name -contains 'Arguments') { $argument = [string]$action.Arguments }
+            foreach ($candidate in $expected) {
+                if (($execute.Trim('"').Trim() -eq $candidate.Execute) -and
+                    ($argument.Trim() -eq $candidate.Argument)) {
+                    $matched = $true
+                    break
+                }
+            }
+            if ($matched) { break }
+        }
+        if (-not $matched) { $reasons += 'task action does not match the expected command line' }
+    } catch {
+        $reasons += 'task action unreadable'
+    }
+
+    try {
+        $triggers = @($task.Triggers)
+        $hasLogon = $false
+        $hasRepetition = $false
+        foreach ($trigger in $triggers) {
+            $typeName = $trigger.CimClass.CimClassName
+            if ($typeName -eq 'MSFT_TaskLogonTrigger') { $hasLogon = $true }
+            if ($trigger.Repetition -and $trigger.Repetition.Interval) {
+                $hasRepetition = $true
+            }
+        }
+        if (-not $hasLogon)      { $reasons += 'task has no logon trigger' }
+        if (-not $hasRepetition) { $reasons += 'task has no repeating supervisor trigger' }
+    } catch {
+        $reasons += 'task triggers unreadable'
+    }
+
+    return $reasons
+}
+
+function Test-WatchdogHeartbeat {
+    <#
+        A watchdog that is installed but not actually running is the failure mode that
+        would otherwise be invisible. For each interactive session older than the grace
+        period, require a state file whose LastCheckUtc is recent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Contract,
+        [int]$GraceMinutes = 10
+    )
+
+    $reasons = @()
+    $staleMinutes = [int]$Contract.RuntimeConfig.HeartbeatStaleMinutes
+    $nowUtc = (Get-Date).ToUniversalTime()
+
+    foreach ($user in @(Get-InteractiveUserProfile)) {
+        # Skip sessions that have only just started; the watchdog may not have run yet.
+        if ($user.SessionStartUtc) {
+            try {
+                $age = $nowUtc - ([datetime]$user.SessionStartUtc).ToUniversalTime()
+                if ($age.TotalMinutes -lt $GraceMinutes) { continue }
+            } catch {
+                # Unknown session age: fall through and evaluate the heartbeat anyway.
+            }
+        }
+
+        $statePath = "$($user.ProfilePath)\AppData\Local\DropboxWatchdog\state.json"
+        if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+            $reasons += ('no watchdog heartbeat for SID {0}' -f $user.Sid)
+            continue
+        }
+
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $names = @($state.PSObject.Properties.Name)
+            if (-not ($names -contains 'LastCheckUtc') -or [string]::IsNullOrWhiteSpace([string]$state.LastCheckUtc)) {
+                $reasons += ('heartbeat for SID {0} has no timestamp' -f $user.Sid)
+                continue
+            }
+            $lastCheck = ([datetime]::Parse([string]$state.LastCheckUtc,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime()
+            $ageMinutes = ($nowUtc - $lastCheck).TotalMinutes
+            if ($ageMinutes -gt $staleMinutes) {
+                $reasons += ('heartbeat for SID {0} is {1} min old' -f $user.Sid, [int]$ageMinutes)
+            }
+        } catch {
+            $reasons += ('heartbeat for SID {0} unreadable' -f $user.Sid)
+        }
+    }
+
+    return $reasons
+}
+
+function Get-ConstrainedSessionNote {
+    <#
+        The watchdog records the language mode it is running under into its heartbeat.
+        Surfacing that here means the language mode of a real user session shows up in
+        the Intune portal, instead of someone having to sign in to a managed device and
+        check $ExecutionContext.SessionState.LanguageMode by hand.
+
+        This is reported, not enforced: the payload is written to run constrained.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $constrained = @()
+    foreach ($user in @(Get-InteractiveUserProfile)) {
+        $statePath = "$($user.ProfilePath)\AppData\Local\DropboxWatchdog\state.json"
+        try {
+            if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { continue }
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $names = @($state.PSObject.Properties.Name)
+            if (-not ($names -contains 'LanguageMode')) { continue }
+            $mode = [string]$state.LanguageMode
+            if ($mode -and $mode -ne 'FullLanguage' -and $mode -ne 'Unknown') {
+                $constrained += ('{0}={1}' -f $user.Sid, $mode)
+            }
+        } catch {
+            continue
+        }
+    }
+
+    if ($constrained.Count -eq 0) { return $null }
+    return (' NOTE: {0} session(s) running under restricted PowerShell ({1}); the watchdog supports this, but script enforcement is active on this device.' -f
+        $constrained.Count, ($constrained -join ', '))
+}
+
+function Invoke-Detection {
+    [CmdletBinding()]
+    param()
+
+    $contract = Get-WatchdogContract
+
+    if (-not (Test-FullLanguageMode)) {
+        return [pscustomobject]@{
+            ExitCode = 1
+            Message  = 'NOT_COMPLIANT: ' + (Get-LanguageModeMessage -Contract $contract)
+        }
+    }
+
+    $reasons = @()
+    $reasons += Test-PayloadInstalled  -Contract $contract
+    $reasons += Test-ConfigCurrent     -Contract $contract
+    $reasons += Test-WatchdogTaskHealthy -Contract $contract
+    $reasons += Test-WatchdogHeartbeat -Contract $contract
+
+    $reasons = @($reasons | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    $note = Get-ConstrainedSessionNote -Contract $contract
+
+    if ($reasons.Count -gt 0) {
+        $message = 'NOT_COMPLIANT: ' + ($reasons -join '; ')
+        if ($note) { $message += $note }
+        if ($message.Length -gt 2000) { $message = $message.Substring(0, 1997) + '...' }
+        return [pscustomobject]@{ ExitCode = 1; Message = $message }
+    }
+
+    $message = 'COMPLIANT: Dropbox watchdog {0} installed, task scoped to all users, heartbeats fresh.' -f
+        $contract.PayloadVersion
+    if ($note) { $message += $note }
+    if ($message.Length -gt 2000) { $message = $message.Substring(0, 1997) + '...' }
+    return [pscustomobject]@{ ExitCode = 0; Message = $message }
+}
+
+if (-not $env:DBW_TEST_IMPORT) {
+    try {
+        $result = Invoke-Detection
+        Write-Output $result.Message
+        exit ([int]$result.ExitCode)
+    } catch {
+        # Any unexpected failure is treated as non-compliant so remediation gets a chance.
+        Write-Output ('NOT_COMPLIANT: detection error - {0}' -f $_.Exception.Message)
+        exit 1
+    }
+}

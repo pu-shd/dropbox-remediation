@@ -1,0 +1,69 @@
+<#
+.SYNOPSIS
+    Intune Remediation - DETECTION script for REMOVING the Dropbox session watchdog.
+
+.DESCRIPTION
+    Pair this with Uninstall-DropboxWatchdog.ps1 as a separate, temporary Intune
+    remediation when retiring the watchdog fleet-wide.
+
+    Deleting a remediation in Intune stops it running but does NOT undo what it already
+    did, so devices would keep the scheduled task forever. This detection reports
+    non-compliant while any trace of the watchdog remains, which drives the uninstall
+    script, and reports compliant once the device is clean.
+
+    Exit 0 = already removed. Exit 1 = run the uninstall script.
+#>
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+@@SHARED_CONTRACT@@
+
+function Get-WatchdogScheduledTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$TaskPath
+    )
+    try {
+        return Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-RemovalDetection {
+    [CmdletBinding()]
+    param()
+
+    $contract = Get-WatchdogContract
+    $remaining = @()
+
+    if (Get-WatchdogScheduledTask -TaskName $contract.TaskName -TaskPath $contract.TaskPath) {
+        $remaining += 'scheduled task still registered'
+    }
+    if (Test-Path -LiteralPath $contract.InstallRoot) {
+        $remaining += 'install directory still present'
+    }
+
+    if ($remaining.Count -gt 0) {
+        return [pscustomobject]@{
+            ExitCode = 1
+            Message  = 'NOT_COMPLIANT: ' + ($remaining -join '; ') + '.'
+        }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Message = 'COMPLIANT: Dropbox watchdog is not present on this device.' }
+}
+
+if (-not $env:DBW_TEST_IMPORT) {
+    try {
+        $result = Invoke-RemovalDetection
+        Write-Output $result.Message
+        exit ([int]$result.ExitCode)
+    } catch {
+        Write-Output ('NOT_COMPLIANT: removal detection error - {0}' -f $_.Exception.Message)
+        exit 1
+    }
+}

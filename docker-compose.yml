@@ -1,0 +1,17 @@
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Builds natively on both arm64 (Apple Silicon) and amd64 (CI). Override with
+    # DBW_PLATFORM if you need to reproduce a specific architecture.
+    platform: ${DBW_PLATFORM:-}
+    image: dropbox-watchdog-tests:latest
+    working_dir: /work
+    volumes:
+      # Mount the sources so an edit-test loop does not require a rebuild, and so
+      # build/ artefacts (including test-results.xml) land back on the host.
+      - ./src:/work/src:ro
+      - ./scripts:/work/scripts:ro
+      - ./tests:/work/tests:ro
+      - ./build:/work/build

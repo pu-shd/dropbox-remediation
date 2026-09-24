@@ -1,0 +1,140 @@
+<#
+.SYNOPSIS
+    Removes the Dropbox session watchdog from a device.
+
+.DESCRIPTION
+    Run as SYSTEM. Deleting the Intune remediation does NOT clean up devices that
+    already received it, so use this script as the removal path:
+
+      * as a one-off Intune remediation (detection: "is the task present?",
+        remediation: this script), or
+      * via scripts/teardown-intune.sh --deploy-cleanup, or
+      * interactively from an elevated prompt for a single device.
+
+    Order matters: the config is neutralised first, which makes any watchdog loop
+    currently running inside a user session exit on its own at the next poll rather
+    than being left orphaned with its script deleted underneath it.
+
+    Exit 0 = removed (or already absent). Exit 1 = removal failed.
+#>
+[CmdletBinding()]
+param(
+    [switch]$KeepLogs
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+@@SHARED_CONTRACT@@
+
+function Unregister-WatchdogTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$TaskPath
+    )
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+        if (-not $task) { return $false }
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Disable-WatchdogConfig {
+    <# Flip Enabled to false so running loops stand down before the files disappear. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+    try {
+        if (-not (Test-Path -LiteralPath $Contract.ConfigPath)) { return $false }
+        $config = Get-Content -LiteralPath $Contract.ConfigPath -Raw | ConvertFrom-Json
+        $config.Enabled = $false
+        $config.PayloadVersion = 'uninstalled'
+        Set-Content -LiteralPath $Contract.ConfigPath -Value ($config | ConvertTo-Json -Depth 4) -Encoding UTF8
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Remove-WatchdogFiles {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+    try {
+        if (-not (Test-Path -LiteralPath $Contract.InstallRoot)) { return $false }
+        Remove-Item -LiteralPath $Contract.InstallRoot -Recurse -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Unregister-WatchdogEventSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($Contract.EventSource)) { return $false }
+        [System.Diagnostics.EventLog]::DeleteEventSource($Contract.EventSource)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Remove-WatchdogUserData {
+    [CmdletBinding()]
+    param()
+    $removed = 0
+    try {
+        $profileRoot = Split-Path -Parent $env:PUBLIC
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { return 0 }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $profileRoot -Directory -ErrorAction SilentlyContinue)) {
+            $userData = "$($dir.FullName)\AppData\Local\DropboxWatchdog"
+            if (Test-Path -LiteralPath $userData) {
+                Remove-Item -LiteralPath $userData -Recurse -Force -ErrorAction SilentlyContinue
+                $removed++
+            }
+        }
+    } catch {
+        return $removed
+    }
+    return $removed
+}
+
+function Invoke-Uninstall {
+    [CmdletBinding()]
+    param([bool]$KeepUserLogs = $false)
+
+    $contract = Get-WatchdogContract
+    $actions = New-Object System.Collections.Generic.List[string]
+
+    if (Disable-WatchdogConfig -Contract $contract) { $actions.Add('config disabled') }
+    if (Unregister-WatchdogTask -TaskName $contract.TaskName -TaskPath $contract.TaskPath) {
+        $actions.Add('scheduled task removed')
+    }
+    if (Remove-WatchdogFiles -Contract $contract) { $actions.Add('install directory removed') }
+    if (Unregister-WatchdogEventSource -Contract $contract) { $actions.Add('event source removed') }
+
+    if (-not $KeepUserLogs) {
+        $count = Remove-WatchdogUserData
+        if ($count -gt 0) { $actions.Add(('per-user data removed from {0} profile(s)' -f $count)) }
+    }
+
+    if ($actions.Count -eq 0) {
+        return [pscustomobject]@{ ExitCode = 0; Message = 'REMOVED: nothing to do, Dropbox watchdog was not installed.' }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Message = ('REMOVED: ' + ($actions -join ', ') + '.') }
+}
+
+if (-not $env:DBW_TEST_IMPORT) {
+    try {
+        $result = Invoke-Uninstall -KeepUserLogs:$KeepLogs.IsPresent
+        Write-Output $result.Message
+        exit ([int]$result.ExitCode)
+    } catch {
+        Write-Output ('FAILED: Dropbox watchdog removal error - {0}' -f $_.Exception.Message)
+        exit 1
+    }
+}

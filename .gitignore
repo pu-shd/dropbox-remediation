@@ -1,0 +1,8 @@
+build/
+*.log
+.DS_Store
+.dbw.env
+
+# Agent tooling - never published
+CLAUDE.md
+.claude/

@@ -1,0 +1,357 @@
+<#
+.SYNOPSIS
+    Intune Remediation - REMEDIATION script for the Dropbox session watchdog.
+
+.DESCRIPTION
+    Runs as SYSTEM, 64-bit. Installs (or repairs) a per-session watchdog that keeps the
+    Dropbox client alive for every user of the device:
+
+      1. Writes the watchdog payload to %ProgramData%\DropboxWatchdog\bin and verifies
+         its SHA-256 against the value baked in at build time.
+      2. Locks down the install directory: SYSTEM and Administrators get full control,
+         BUILTIN\Users get read and execute only, so a standard user cannot tamper with
+         a script that will be executed in every other user's session.
+      3. Writes the runtime config consumed by the payload.
+      4. Registers the Application event-log source (only SYSTEM can do this).
+      5. Registers a scheduled task scoped to the BUILTIN\Users *group*, so it runs
+         inside the interactive session of whoever is logged on - including users who
+         first sign in months from now - with an at-logon trigger plus a repeating
+         supervisor trigger that resurrects the watchdog if it ever dies.
+
+    The task, not this script, is what restarts Dropbox. Intune only guarantees the
+    watchdog itself exists and is healthy.
+
+    Exit 0 = remediated. Exit 1 = remediation failed (Intune will report and retry).
+
+.NOTES
+    Windows PowerShell 5.1 compatible. Output is kept under Intune's 2048-character limit.
+#>
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+@@SHARED_CONTRACT@@
+
+# Gzip+Base64 of src/payload/DropboxWatchdog.ps1, injected by scripts/build.sh.
+# Set by Register-WatchdogTask to whichever launcher the device supports.
+$Script:SelectedLauncher = $null
+
+$Script:PayloadGzipBase64 = @'
+@@PAYLOAD_B64@@
+'@
+
+#--------------------------------------------------------------------------------------
+# Windows API wrappers (mockable in the test suite)
+#--------------------------------------------------------------------------------------
+
+function Expand-PayloadBytes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Base64)
+
+    $compressed = [System.Convert]::FromBase64String($Base64)
+    $inputStream = New-Object System.IO.MemoryStream(, $compressed)
+    $output = New-Object System.IO.MemoryStream
+    try {
+        $gzip = New-Object System.IO.Compression.GZipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+        try {
+            $buffer = New-Object byte[] 8192
+            while ($true) {
+                $read = $gzip.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $output.Write($buffer, 0, $read)
+            }
+        } finally {
+            $gzip.Dispose()
+        }
+        return $output.ToArray()
+    } finally {
+        $output.Dispose()
+        $inputStream.Dispose()
+    }
+}
+
+function Write-BinaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$Bytes
+    )
+    # Resolve to a real filesystem path first. PowerShell's provider cmdlets and raw
+    # .NET file APIs do not normalise paths identically, and writing with one while
+    # verifying with the other can silently target two different files.
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    [System.IO.File]::WriteAllBytes($full, $Bytes)
+}
+
+function Invoke-Icacls {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $exe = "$env:SystemRoot\System32\icacls.exe"
+    $output = & $exe @Arguments 2>&1
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = ($output | Out-String).Trim()
+    }
+}
+
+function Register-EventSource {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$LogName
+    )
+    if ([System.Diagnostics.EventLog]::SourceExists($Source)) { return $false }
+    [System.Diagnostics.EventLog]::CreateEventSource($Source, $LogName)
+    return $true
+}
+
+function Get-WatchdogScheduledTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$TaskPath
+    )
+    try {
+        return Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Test-HeadlessConsoleSupported {
+    <#
+        Actually run "conhost.exe --headless cmd.exe /c exit 0" rather than assuming the
+        switch exists. Registering a task around an unsupported launcher would produce a
+        watchdog that never starts - and the only symptom would be a stale heartbeat an
+        hour later, repaired by re-registering the same broken command line.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    try {
+        if (-not (Test-Path -LiteralPath $Contract.TaskExecute -PathType Leaf)) { return $false }
+        $cmd = "$env:SystemRoot\System32\cmd.exe"
+        if (-not (Test-Path -LiteralPath $cmd -PathType Leaf)) { return $false }
+
+        $proc = Start-Process -FilePath $Contract.TaskExecute `
+            -ArgumentList @('--headless', $cmd, '/c', 'exit', '0') `
+            -PassThru -WindowStyle Hidden -ErrorAction Stop
+        $exited = $proc.WaitForExit(15000)
+        if (-not $exited) {
+            try { $proc.Kill() } catch { }
+            return $false
+        }
+        return ($proc.ExitCode -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Register-WatchdogTask {
+    <#
+        A group principal (BUILTIN\Users) with RunLevel Limited means Task Scheduler
+        instantiates the task inside each logged-on member's own interactive session,
+        with that user's environment and desktop - which is exactly where Dropbox has
+        to live. No stored credentials, no session-0 launches, and it automatically
+        covers users who have never signed in to the device yet.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $launcher = @(Get-ExpectedTaskAction -Contract $Contract)[0]
+    if (-not (Test-HeadlessConsoleSupported -Contract $Contract)) {
+        $launcher = @(Get-ExpectedTaskAction -Contract $Contract)[1]
+    }
+    $Script:SelectedLauncher = $launcher.Name
+
+    $action = New-ScheduledTaskAction -Execute $launcher.Execute -Argument $launcher.Argument
+
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+    $logonTrigger.Delay = $Contract.LogonDelay
+
+    # Start boundary in the near past + indefinite repetition: fires in every already
+    # logged-on session shortly after install, then acts as the supervisor heartbeat.
+    $supervisorTrigger = New-ScheduledTaskTrigger -Once `
+        -At (Get-Date).AddMinutes(-1) `
+        -RepetitionInterval (New-TimeSpan -Minutes $Contract.SupervisorMinutes) `
+        -RepetitionDuration ([TimeSpan]::MaxValue)
+
+    $principal = New-ScheduledTaskPrincipal `
+        -GroupId (Get-UsersGroupName -Sid $Contract.UsersGroupSid) `
+        -RunLevel Limited
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -Hidden `
+        -MultipleInstances Parallel `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 5)
+
+    # Parallel instances are required because one instance runs per user session; the
+    # payload holds a session-local mutex to prevent duplicates within a single session.
+
+    Register-ScheduledTask `
+        -TaskName $Contract.TaskName `
+        -TaskPath $Contract.TaskPath `
+        -Action $action `
+        -Trigger @($logonTrigger, $supervisorTrigger) `
+        -Principal $principal `
+        -Settings $settings `
+        -Description 'Keeps the Dropbox client running in every interactive user session. Managed by Intune.' `
+        -Force | Out-Null
+
+    return $true
+}
+
+#--------------------------------------------------------------------------------------
+# Remediation steps
+#--------------------------------------------------------------------------------------
+
+function Install-WatchdogPayload {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    foreach ($dir in @($Contract.InstallRoot, $Contract.BinDir)) {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+    }
+
+    $bytes = Expand-PayloadBytes -Base64 $Script:PayloadGzipBase64
+    if (-not $bytes -or $bytes.Length -eq 0) {
+        throw 'Embedded watchdog payload decompressed to zero bytes.'
+    }
+
+    Write-BinaryFile -Path $Contract.PayloadPath -Bytes $bytes
+
+    $hash = (Get-FileHash -LiteralPath $Contract.PayloadPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($hash -ne $Contract.PayloadSha256) {
+        throw ('Payload hash verification failed: wrote {0}, expected {1}.' -f $hash, $Contract.PayloadSha256)
+    }
+
+    return $Contract.PayloadPath
+}
+
+function Set-WatchdogAcl {
+    <#
+        The payload runs in every user's session, so a non-admin must not be able to
+        modify it. Reset inheritance and grant by SID for language independence.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $result = Invoke-Icacls -Arguments @(
+        $Contract.InstallRoot,
+        '/inheritance:r',
+        '/grant:r', '*S-1-5-18:(OI)(CI)F',      # NT AUTHORITY\SYSTEM
+        '/grant:r', '*S-1-5-32-544:(OI)(CI)F',  # BUILTIN\Administrators
+        '/grant:r', '*S-1-5-32-545:(OI)(CI)RX', # BUILTIN\Users - read + execute only
+        '/T', '/C', '/Q'
+    )
+    if ($result.ExitCode -ne 0) {
+        throw ('icacls failed with exit code {0}: {1}' -f $result.ExitCode, $result.Output)
+    }
+    return $true
+}
+
+function Write-WatchdogConfig {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    $config = [ordered]@{
+        PayloadVersion  = $Contract.PayloadVersion
+        ContractVersion = $Contract.ContractVersion
+        InstalledUtc    = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    foreach ($key in @($Contract.RuntimeConfig.Keys)) {
+        $config[$key] = $Contract.RuntimeConfig[$key]
+    }
+
+    $json = [pscustomobject]$config | ConvertTo-Json -Depth 4
+    Set-Content -LiteralPath $Contract.ConfigPath -Value $json -Encoding UTF8 -ErrorAction Stop
+    return $Contract.ConfigPath
+}
+
+function Install-WatchdogEventSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+    try {
+        return Register-EventSource -Source $Contract.EventSource -LogName $Contract.EventLogName
+    } catch {
+        # Non-fatal: the watchdog degrades to file-only logging.
+        return $false
+    }
+}
+
+function Install-WatchdogTask {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Contract)
+
+    # Always (re-)register: it is idempotent via -Force, repairs any drift in the action,
+    # principal or triggers, and costs milliseconds.
+    Register-WatchdogTask -Contract $Contract | Out-Null
+
+    $task = Get-WatchdogScheduledTask -TaskName $Contract.TaskName -TaskPath $Contract.TaskPath
+    if (-not $task) {
+        throw 'Scheduled task was not present after registration.'
+    }
+    return $true
+}
+
+function Invoke-Remediation {
+    [CmdletBinding()]
+    param()
+
+    $contract = Get-WatchdogContract
+
+    if (-not (Test-FullLanguageMode)) {
+        # Half-installing under ConstrainedLanguage would leave a watchdog that cannot
+        # run, reported as a stale heartbeat an hour later. Stop with the real reason.
+        throw (Get-LanguageModeMessage -Contract $contract)
+    }
+
+    $steps = New-Object System.Collections.Generic.List[string]
+
+    Install-WatchdogPayload -Contract $contract | Out-Null
+    $steps.Add('payload installed+verified')
+
+    Set-WatchdogAcl -Contract $contract | Out-Null
+    $steps.Add('ACL hardened')
+
+    Write-WatchdogConfig -Contract $contract | Out-Null
+    $steps.Add('config written')
+
+    if (Install-WatchdogEventSource -Contract $contract) {
+        $steps.Add('event source created')
+    } else {
+        $steps.Add('event source present')
+    }
+
+    Install-WatchdogTask -Contract $contract | Out-Null
+    $launcherName = 'headless'
+    if ($Script:SelectedLauncher) { $launcherName = $Script:SelectedLauncher }
+    $steps.Add(('scheduled task registered for all users ({0} launcher)' -f $launcherName))
+
+    $message = 'REMEDIATED: Dropbox watchdog {0} - {1}. Watchdog starts in each session within {2} min.' -f
+        $contract.PayloadVersion, ($steps -join ', '), $contract.SupervisorMinutes
+    if ($message.Length -gt 2000) { $message = $message.Substring(0, 1997) + '...' }
+
+    return [pscustomobject]@{ ExitCode = 0; Message = $message }
+}
+
+if (-not $env:DBW_TEST_IMPORT) {
+    try {
+        $result = Invoke-Remediation
+        Write-Output $result.Message
+        exit ([int]$result.ExitCode)
+    } catch {
+        Write-Output ('FAILED: Dropbox watchdog remediation error - {0}' -f $_.Exception.Message)
+        exit 1
+    }
+}
