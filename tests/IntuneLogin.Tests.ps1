@@ -43,7 +43,7 @@ BeforeAll {
         $token = Script:New-FakeJwt @{
             upn = $SignedInAs
             tid = '11111111-1111-1111-1111-111111111111'
-            scp = 'DeviceManagementConfiguration.ReadWrite.All'
+            scp = 'DeviceManagementScripts.ReadWrite.All'
         }
 
         $fakeAz = @"

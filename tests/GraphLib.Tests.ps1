@@ -68,7 +68,7 @@ Describe 'graph_jwt_claim' {
         $Script:UserJwt = Script:New-FakeJwt @{
             upn = 'intune-admin@contoso.com'
             tid = '11111111-2222-3333-4444-555555555555'
-            scp = 'DeviceManagementConfiguration.ReadWrite.All User.Read'
+            scp = 'DeviceManagementScripts.ReadWrite.All User.Read'
         }
     }
 
@@ -103,7 +103,7 @@ Describe 'graph_assert_identity' {
         $Script:IntuneJwt = Script:New-FakeJwt @{
             upn = 'intune-admin@contoso.com'
             tid = '11111111-2222-3333-4444-555555555555'
-            scp = 'DeviceManagementConfiguration.ReadWrite.All'
+            scp = 'DeviceManagementScripts.ReadWrite.All'
         }
         $Script:EverydayJwt = Script:New-FakeJwt @{
             upn = 'everyday-user@contoso.com'
@@ -113,7 +113,7 @@ Describe 'graph_assert_identity' {
         $Script:AppJwt = Script:New-FakeJwt @{
             appid = '99999999-8888-7777-6666-555555555555'
             tid   = '11111111-2222-3333-4444-555555555555'
-            roles = 'DeviceManagementConfiguration.ReadWrite.All'
+            roles = 'DeviceManagementScripts.ReadWrite.All'
         }
     }
 
@@ -186,6 +186,30 @@ graph_assert_identity '$Script:EverydayJwt'
         $result.ExitCode | Should -Be 0
         $result.StdErr | Should -Match 'WARNING'
         $result.StdErr | Should -Match '403'
+    }
+
+    It 'warns when the token has only the Configuration family for a scripts endpoint' {
+        # Kept deliberately permissive: some tenants grant both families, and other
+        # Intune endpoints do use DeviceManagementConfiguration. Remediations do not.
+        $configOnly = Script:New-FakeJwt @{
+            upn = 'intune-admin@contoso.com'
+            scp = 'DeviceManagementConfiguration.ReadWrite.All'
+        }
+        $result = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_assert_identity '$configOnly'
+"@
+        $result.ExitCode | Should -Be 0
+        $result.StdErr | Should -Not -Match 'WARNING'
+    }
+
+    It 'names DeviceManagementScripts, the permission remediations actually enforce' {
+        $noScope = Script:New-FakeJwt @{ upn = 'intune-admin@contoso.com'; scp = 'User.Read' }
+        $result = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_assert_identity '$noScope'
+"@
+        $result.StdErr | Should -Match 'DeviceManagementScripts\.ReadWrite\.All'
     }
 
     It 'does not warn when the token carries the Intune scope' {
@@ -261,5 +285,120 @@ rm -rf "`$root"
 "@
         $result.ExitCode | Should -Be 0
         $result.StdOut | Should -Match 'ok upn=<unset>'
+    }
+}
+
+Describe 'graph_request' {
+    BeforeAll {
+        function Script:Invoke-GraphRequest {
+            <#
+                Runs graph_request against a fake curl on PATH. Exercising the real
+                function matters: it must locate external commands (mktemp, curl, jq)
+                and assign a status variable, and zsh reserves names for both.
+            #>
+            param([int]$HttpStatus = 200, [string]$Body = '{"value":[]}', [string]$Method = 'GET')
+
+            $work = Join-Path ([System.IO.Path]::GetTempPath()) ("dbw-req-" + [Guid]::NewGuid().ToString('n'))
+            $bin = Join-Path $work 'bin'
+            New-Item -ItemType Directory -Path $bin -Force | Out-Null
+
+            $bodyFile = Join-Path $work 'body.json'
+            Set-Content -LiteralPath $bodyFile -Value $Body
+
+            $fakeCurl = @"
+#!/usr/bin/env zsh
+# Mimic: curl -sS -o <file> -w '%{http_code}' ...
+out=''
+prev=''
+for a in "`$@"; do
+  if [[ "`$prev" == "-o" ]]; then out="`$a"; fi
+  prev="`$a"
+done
+if [[ -n "`$out" ]]; then cp '$bodyFile' "`$out"; fi
+print -n -- '$HttpStatus'
+"@
+            Set-Content -LiteralPath (Join-Path $bin 'curl') -Value $fakeCurl
+            & chmod +x (Join-Path $bin 'curl')
+
+            $runner = Join-Path $work 'run.zsh'
+            Set-Content -LiteralPath $runner -Value @"
+export PATH='$bin':`$PATH
+ROOT_DIR='$work'
+source '$Script:GraphLib'
+GRAPH_TOKEN='fake-token'
+graph_request $Method '/deviceManagement/deviceHealthScripts'
+print -- "RC=`$?"
+"@
+            $errFile = Join-Path $work 'err.txt'
+            $stdout = (& zsh $runner 2>$errFile | Out-String)
+            $stderr = ''
+            if (Test-Path -LiteralPath $errFile) { $stderr = Get-Content -LiteralPath $errFile -Raw }
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+
+            return [pscustomobject]@{ StdOut = $stdout; StdErr = $stderr }
+        }
+    }
+
+    It 'returns the response body and succeeds on 200' {
+        $r = Script:Invoke-GraphRequest -HttpStatus 200 -Body '{"value":[{"id":"abc"}]}'
+        $r.StdOut | Should -Match 'RC=0'
+        $r.StdOut | Should -Match '"id":"abc"'
+    }
+
+    It 'can still find external commands - zsh ties $path to $PATH' {
+        # A local named 'path' inside the function would wipe command lookup, making
+        # mktemp and curl vanish at runtime with "command not found".
+        $r = Script:Invoke-GraphRequest -HttpStatus 200
+        $r.StdErr | Should -Not -Match 'command not found'
+    }
+
+    It 'can assign its status variable - zsh makes $status read-only' {
+        $r = Script:Invoke-GraphRequest -HttpStatus 200
+        $r.StdErr | Should -Not -Match 'read-only variable'
+    }
+
+    It 'fails and surfaces the Graph error message on 403' {
+        $r = Script:Invoke-GraphRequest -HttpStatus 403 -Body '{"error":{"message":"Forbidden - missing scope"}}'
+        $r.StdOut | Should -Match 'RC=1'
+        $r.StdErr | Should -Match 'HTTP 403'
+        $r.StdErr | Should -Match 'Forbidden - missing scope'
+    }
+
+    It 'fails on 404 as well as 403' {
+        $r = Script:Invoke-GraphRequest -HttpStatus 404 -Body '{"error":{"message":"not found"}}'
+        $r.StdOut | Should -Match 'RC=1'
+        $r.StdErr | Should -Match 'HTTP 404'
+    }
+
+    It 'treats 201 as success, since creates return it' {
+        $r = Script:Invoke-GraphRequest -HttpStatus 201 -Body '{"id":"new"}' -Method POST
+        $r.StdOut | Should -Match 'RC=0'
+        $r.StdOut | Should -Match '"id":"new"'
+    }
+}
+
+Describe 'zsh reserved parameter names' {
+    It 'never declares or assigns a zsh special parameter in any shipped script' {
+        # zsh ties $path to $PATH and makes $status read-only, among others. Both fail
+        # only at runtime, in the one code path that talks to the tenant.
+        $reserved = 'status|path|argv|options|commands|functions|aliases|signals|pipestatus|EUID|UID|GID|PPID|PWD|RANDOM|SECONDS|TTY|USERNAME|ARGC|LINENO|HOST'
+        $scripts = @(Get-ChildItem -LiteralPath (Join-Path $Script:RepoRoot 'scripts') -Filter '*.sh' -Recurse)
+        $scripts.Count | Should -BeGreaterThan 0
+
+        $offenders = @()
+        foreach ($file in $scripts) {
+            $lineNo = 0
+            foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+                $lineNo++
+                if ($line -match '^\s*#') { continue }
+                if ($line -match "\b(local|typeset|declare)\b[^#]*\b($reserved)\b\s*[=\s]") {
+                    $offenders += "$($file.Name):$lineNo declares '$($Matches[2])'"
+                }
+                if ($line -match "^\s*($reserved)=") {
+                    $offenders += "$($file.Name):$lineNo assigns '$($Matches[1])'"
+                }
+            }
+        }
+        @($offenders).Count | Should -Be 0 -Because ($offenders -join '; ')
     }
 }

@@ -7,11 +7,14 @@
 #   1. App registration (non-interactive, best for CI):
 #        DBW_TENANT_ID, DBW_CLIENT_ID, DBW_CLIENT_SECRET
 #      The app needs the APPLICATION permission
-#      DeviceManagementConfiguration.ReadWrite.All (admin consented).
+#      DeviceManagementScripts.ReadWrite.All (admin consented). That is the permission
+#      the deviceHealthScripts endpoint actually enforces - not
+#      DeviceManagementConfiguration.*, which governs other Intune resources.
 #   2. Azure CLI delegated token:
 #        zsh scripts/intune-login.sh
-#      The signed-in account needs an Intune role that can manage remediations
-#      (Intune Administrator, or a custom role with Device configurations R/W).
+#      The signed-in account needs both the Graph scope above and an Intune role that
+#      can manage remediations (Intune Administrator, or a custom role with the
+#      device-scripts permissions).
 #
 # Multiple identities: if your Intune access lives on a different account from the one
 # you normally use with az, set DBW_AZURE_CONFIG_DIR to a dedicated Azure CLI profile
@@ -102,13 +105,17 @@ graph_assert_identity() {
 
   scp="$(graph_jwt_claim "$token" scp)"
   roles="$(graph_jwt_claim "$token" roles)"
-  if [[ -n "$scp" && "$scp" != *DeviceManagementConfiguration* ]]; then
-    print -u2 -- "graph: WARNING: this token does not carry a DeviceManagementConfiguration scope, so writes will probably fail with 403."
+  # deviceHealthScripts enforces DeviceManagementScripts.*; accept the Configuration
+  # family too, since other Intune endpoints use it and tenants sometimes grant both.
+  if [[ -n "$scp" && "$scp" != *DeviceManagementScripts* && "$scp" != *DeviceManagementConfiguration* ]]; then
+    print -u2 -- "graph: WARNING: this token carries no Intune device-management scope, so calls will fail with 403."
     print -u2 -- "graph:          scopes: ${scp}"
-    print -u2 -- "graph:          Grant the Azure CLI app consent for DeviceManagementConfiguration.ReadWrite.All, or use an app registration."
-  elif [[ -z "$scp" && -n "$roles" && "$roles" != *DeviceManagementConfiguration* ]]; then
-    print -u2 -- "graph: WARNING: this app registration has no DeviceManagementConfiguration role; writes will fail with 403."
+    print -u2 -- "graph:          Remediations need DeviceManagementScripts.ReadWrite.All. Grant the Azure CLI app"
+    print -u2 -- "graph:          consent for it, or use an app registration (see README)."
+  elif [[ -z "$scp" && -n "$roles" && "$roles" != *DeviceManagementScripts* && "$roles" != *DeviceManagementConfiguration* ]]; then
+    print -u2 -- "graph: WARNING: this app registration has no Intune device-management role; calls will fail with 403."
     print -u2 -- "graph:          roles: ${roles}"
+    print -u2 -- "graph:          Grant it the DeviceManagementScripts.ReadWrite.All APPLICATION permission with admin consent."
   fi
 }
 
@@ -154,25 +161,40 @@ graph_token() {
 # graph_request METHOD PATH [BODY_FILE]
 # Prints the response body. Exits non-zero (with the error shown) on HTTP >= 400.
 graph_request() {
-  local method="$1" path="$2" body_file="${3:-}"
-  local url="$path"
-  [[ "$url" == http* ]] || url="${GRAPH_BASE}${path}"
+  # NOTE: neither 'path' nor 'status' may be used as variable names here. In zsh 'path'
+  # is tied to $PATH as an array, so a local 'path' wipes command lookup for the whole
+  # function, and 'status' is a read-only alias for $?. Both fail only at runtime.
+  local method="$1" request_path="$2" body_file="${3:-}"
+  local url="$request_path"
+  [[ "$url" == http* ]] || url="${GRAPH_BASE}${request_path}"
 
-  local tmp status
-  tmp="$(mktemp "${TMPDIR:-/tmp}/dbw-graph.XXXXXX")"
+  local tmp http_status
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dbw-graph.XXXXXX")" || {
+    print -u2 -- "graph: could not create a temporary file"
+    return 1
+  }
 
   if [[ -n "$body_file" ]]; then
-    status="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$url" \
+    http_status="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$url" \
       -H "Authorization: Bearer ${GRAPH_TOKEN}" \
       -H 'Content-Type: application/json' \
       --data-binary "@${body_file}")"
   else
-    status="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$url" \
+    http_status="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$url" \
       -H "Authorization: Bearer ${GRAPH_TOKEN}")"
   fi
 
-  if (( status >= 400 )); then
-    print -u2 -- "graph: ${method} ${path} -> HTTP ${status}"
+  if [[ -z "$http_status" ]]; then
+    print -u2 -- "graph: ${method} ${request_path} -> no response from curl"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if (( http_status >= 400 )); then
+    print -u2 -- "graph: ${method} ${request_path} -> HTTP ${http_status}"
+    # Redirection order matters: send stdout to stderr FIRST, then silence jq's own
+    # stderr. Reversing them points stdout at an already-nulled stderr and the message
+    # disappears.
     jq -r '.error.message // .' "$tmp" >&2 2>/dev/null || cat "$tmp" >&2
     rm -f "$tmp"
     return 1

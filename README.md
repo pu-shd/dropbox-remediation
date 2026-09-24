@@ -290,9 +290,13 @@ when. Add `--device-code` if the browser keeps picking your everyday account.
 ### If you get a 403
 
 A successful login only means you authenticated. The Azure CLI's own client app must also
-be consented for `DeviceManagementConfiguration.ReadWrite.All` in the tenant, and in many
+be consented for `DeviceManagementScripts.ReadWrite.All` in the tenant, and in many
 tenants it is not. The scripts inspect the token's scopes and warn you *before* sending
 anything.
+
+> Remediations are governed by `DeviceManagementScripts.*`, **not**
+> `DeviceManagementConfiguration.*`. The latter covers other Intune resources and will
+> not get you past a 403 on `deviceHealthScripts`.
 
 If that consent is missing — or for anything scheduled or shared — use an app registration.
 It is the better answer for repeated use anyway: no dependency on a human account, no
@@ -303,8 +307,8 @@ export DBW_TENANT_ID=...  DBW_CLIENT_ID=...  DBW_CLIENT_SECRET=...
 unset DBW_EXPECT_UPN     # that guard is for user sign-ins
 ```
 
-Give the app the **application** permission `DeviceManagementConfiguration.ReadWrite.All`
-with admin consent. When these three variables are set the Azure CLI is not used at all,
+Give the app the **application** permission `DeviceManagementScripts.ReadWrite.All`
+with admin consent (Graph app id `00000003-0000-0000-c000-000000000000`). When these three variables are set the Azure CLI is not used at all,
 so your `az` session is irrelevant.
 
 If your Intune role is **PIM-eligible** rather than permanently assigned, activate it
