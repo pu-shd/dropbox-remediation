@@ -39,7 +39,9 @@ Usage: intune-login.sh [options]
                       auth); the login is rejected if a different account comes back.
   --tenant <id>       Tenant id or domain. Optional; defaults to the account's home tenant.
   --profile <dir>     Azure CLI profile directory. Default: ~/.azure-intune
-  --device-code       Use device-code flow instead of opening a browser.
+  --device-code       Use device-code flow instead of the browser redirect. Often
+                      blocked by Conditional Access; the default flow is
+                      authorization-code and handles MFA normally.
   --status            Show who this profile is signed in as, then exit.
   --logout            Sign out of this profile and exit.
   --no-env            Do not write .dbw.env.
@@ -115,9 +117,12 @@ fi
 graph_info "signing in to profile ${PROFILE_DIR}"
 if (( DEVICE_CODE )); then
   graph_info "follow the device-code prompt below and sign in as: ${ACCOUNT}"
+  graph_info "note: many tenants block device code flow via Conditional Access"
 else
+  # The default flow is authorization-code with a localhost redirect - not device code -
+  # and handles MFA in the browser normally.
   graph_info "a browser will open - sign in as: ${ACCOUNT}"
-  graph_info "if it signs you in silently as a different account, re-run with --device-code"
+  graph_info "if it signs you in silently as someone else, sign out of the Microsoft session in that browser (or use a private window) and re-run"
 fi
 
 graph_az "${LOGIN_ARGS[@]}" >/dev/null || graph_die "az login failed"
@@ -130,7 +135,7 @@ if [[ "${SIGNED_IN:l}" != "${ACCOUNT:l}" ]]; then
   # profile only - the caller's default az session is in a different directory and is
   # not touched.
   graph_az logout 2>/dev/null || true
-  graph_die "signed in as ${SIGNED_IN}, not ${ACCOUNT}. The browser reused an existing session; re-run with --device-code, or use a private browser window."
+  graph_die "signed in as ${SIGNED_IN}, not ${ACCOUNT}. The browser reused an existing Microsoft session. Sign out of it (or use a private window / separate browser profile) and re-run. --device-code is an alternative where Conditional Access permits it."
 fi
 
 # Prove the account can actually get a Graph token with usable scopes before

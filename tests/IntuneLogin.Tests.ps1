@@ -106,6 +106,14 @@ Describe 'intune-login.sh interactive login' {
         $r.Output | Should -Match 'sign in as: intune-admin@contoso\.com'
     }
 
+    It 'does not steer the user toward device code by default' {
+        # Conditional Access blocks device code flow in many tenants. The default
+        # authorization-code redirect handles MFA on its own, so it must not be
+        # presented as the remedy for an ordinary wrong-account login.
+        $r = Script:Invoke-Login
+        $r.Output | Should -Not -Match 'device.code'
+    }
+
     It 'succeeds when the account that comes back is the one requested' {
         $r = Script:Invoke-Login
         $r.ExitCode | Should -Be 0 -Because $r.Output
@@ -116,7 +124,7 @@ Describe 'intune-login.sh interactive login' {
         $r = Script:Invoke-Login -Account 'intune-admin@contoso.com' -SignedInAs 'everyday-user@contoso.com'
         $r.ExitCode | Should -Not -Be 0
         $r.Output | Should -Match 'signed in as everyday-user@contoso\.com, not intune-admin@contoso\.com'
-        $r.Output | Should -Match 'device-code'
+        $r.Output | Should -Match 'Sign out of it'
     }
 
     It 'signs the wrong account back out of this profile rather than leaving it active' {
