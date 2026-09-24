@@ -402,3 +402,60 @@ Describe 'zsh reserved parameter names' {
         @($offenders).Count | Should -Be 0 -Because ($offenders -join '; ')
     }
 }
+
+Describe 'graph_urlencode' {
+    It 'encodes the spaces and quotes an OData filter always contains' {
+        # curl rejects these raw with "Malformed input to a URL function", so an
+        # unencoded $filter fails before it ever reaches Graph.
+        $r = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_urlencode "displayName eq 'Some Group'"
+"@
+        $r.StdOut.Trim() | Should -Be 'displayName%20eq%20%27Some%20Group%27'
+    }
+
+    It 'leaves unreserved characters alone' {
+        $r = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_urlencode 'abcXYZ089.-_~'
+"@
+        $r.StdOut.Trim() | Should -Be 'abcXYZ089.-_~'
+    }
+
+    It 'encodes the characters that would break or inject into a query string' {
+        $r = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_urlencode 'a&b=c?d/e+f#g'
+"@
+        $r.StdOut.Trim() | Should -Be 'a%26b%3Dc%3Fd%2Fe%2Bf%23g'
+    }
+
+    It 'returns empty for empty input rather than failing' {
+        $r = Script:Invoke-Zsh @"
+source '$Script:GraphLib'
+graph_urlencode ''
+echo "rc=`$?"
+"@
+        $r.StdOut | Should -Match 'rc=0'
+    }
+}
+
+Describe 'OData filters are encoded before use' {
+    It 'never embeds a raw space in a \$filter expression' {
+        # Source-level guard: every filter must go through graph_urlencode.
+        $scripts = @(Get-ChildItem -LiteralPath (Join-Path $Script:RepoRoot 'scripts') -Filter '*.sh' -Recurse)
+        $offenders = @()
+        foreach ($file in $scripts) {
+            $lineNo = 0
+            foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+                $lineNo++
+                if ($line -match '^\s*#') { continue }
+                # A $filter= followed by text containing a space, not produced by the encoder.
+                if ($line -match '\$filter=' -and $line -notmatch 'graph_urlencode' -and $line -match '\$filter=[^"&]*\s') {
+                    $offenders += "$($file.Name):$lineNo"
+                }
+            }
+        }
+        @($offenders).Count | Should -Be 0 -Because ("unencoded OData filter at: " + ($offenders -join ', '))
+    }
+}

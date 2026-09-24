@@ -205,6 +205,21 @@ graph_request() {
   return 0
 }
 
+# graph_urlencode STRING -> percent-encoded for use as a URL query-parameter value.
+# OData $filter expressions contain spaces and single quotes; curl rejects those raw
+# with "Malformed input to a URL function".
+graph_urlencode() {
+  local raw="$1" out='' ch i
+  for (( i = 1; i <= ${#raw}; i++ )); do
+    ch="${raw[i]}"
+    case "$ch" in
+      [A-Za-z0-9._~-]) out+="$ch" ;;
+      *) out+="$(printf '%%%02X' "'${ch}")" ;;
+    esac
+  done
+  print -- "$out"
+}
+
 # graph_b64 FILE  -> base64 of the file with no line breaks (macOS + Linux).
 graph_b64() {
   base64 < "$1" | tr -d '\n'
@@ -218,9 +233,11 @@ graph_group_id() {
     return 0
   fi
 
-  local escaped response id
+  local escaped response id filter
+  # OData escapes a single quote by doubling it.
   escaped="${value//\'/\'\'}"
-  response="$(graph_request GET "/groups?\$filter=displayName eq '${escaped}'&\$select=id,displayName")" \
+  filter="$(graph_urlencode "displayName eq '${escaped}'")"
+  response="$(graph_request GET "/groups?\$filter=${filter}&\$select=id,displayName")" \
     || graph_die "group lookup failed for '$value'"
 
   local count
