@@ -315,6 +315,55 @@ If your Intune role is **PIM-eligible** rather than permanently assigned, activa
 before deploying — the token is minted at deploy time, and an unactivated role produces
 the same 403 that the scope warning will not catch.
 
+## Prerequisites
+
+Confirm these before deploying, in this order. The first is a tenant toggle that is
+**off by default** and blocks Remediations entirely.
+
+### 1. Tenant licence attestation (off by default)
+
+**Tenant administration** -> **Connectors and tokens** -> **Windows data** ->
+*I confirm that my tenant owns one of these licenses* -> **On**.
+
+Microsoft lists Remediations as a feature requiring this attestation, and it defaults to
+*Off*. It "confirms tenant entitlement for those features; it does not validate or assign
+licenses to individual devices". An **Intune Service Administrator** must set it before
+Remediations is used for the first time.
+
+If assignment fails in the portal and nothing else here is wrong, check this first.
+
+### 2. Device-user licensing
+
+Remediations require **the users of the devices** - not the administrator - to hold one of:
+
+* Windows Enterprise E3 or E5 (included in Microsoft 365 F3, E3, E5)
+* Windows Education A3 or A5 (included in Microsoft 365 A3, A5)
+* Windows Virtual Desktop Access (VDA) per user
+
+To check what a device's owner actually holds:
+
+```zsh
+az rest --method GET \
+  --url "https://graph.microsoft.com/v1.0/devices/<entra-device-object-id>/registeredOwners" \
+  --query "value[].userPrincipalName" -o tsv
+
+az rest --method GET \
+  --url "https://graph.microsoft.com/v1.0/users/<upn>/licenseDetails" \
+  --query "value[].skuPartNumber" -o tsv
+```
+
+### 3. Device eligibility
+
+Microsoft Entra joined or hybrid joined, MDM-enrolled, running Windows Enterprise,
+Professional or Education edition (or co-managed).
+
+### 4. RBAC
+
+The operator needs permissions under the **Device configurations** category of their
+Intune role. Creating a script package and assigning one can be separate rights in a
+custom role, which produces the confusing case where creation succeeds and assignment
+fails.
+
 ## Installation
 
 Two supported paths. They produce **identical** results — the portal uploads the same two
@@ -362,9 +411,15 @@ zsh scripts/build.sh && open build/
    Two of those look wrong and are not. **Logged-on credentials = No** is the design:
    the script must be SYSTEM to write `%ProgramData%`, set ACLs, create the event source
    and register a task for *all* users — the watchdog it installs is what runs as the
-   user. **64-bit = Yes** matters because the task command line is built from
-   `$env:SystemRoot` at install time, which would resolve through `SysWOW64` under the
-   32-bit host.
+   user.
+
+   **64-bit = Yes** *diverges from Microsoft's generic recommendation of No*, and
+   deliberately. Under the 32-bit host, WOW64 registry redirection sends
+   `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList` to `WOW6432Node`,
+   where it does not exist. The detection script maps interactive session SIDs to profile
+   paths through that key, so under 32-bit it would find no profiles and silently report
+   every session as missing a heartbeat. Microsoft's "No" is a sound default for simple
+   scripts; it is wrong for this one.
 
 4. **Assignments** — select your device group, open the assignment's schedule, set
    **Hourly / every 1 hour**, leave remediation enabled.
@@ -395,9 +450,18 @@ The script is create-or-update: it matches on display name, so re-running is saf
 
 ### What happens on the device
 
-Devices act at their next Intune check-in. The first remediation run installs the
-watchdog; the watchdog starts in every signed-in session within 30 minutes, and at every
-logon after that.
+Two different clocks, and they are easy to conflate:
+
+| | |
+|---|---|
+| **Policy delivery** | The Intune Management Extension fetches remediation script policy after a device restart, after the IME service restarts, after a user signs in, and otherwise **once every 8 hours**. A new or updated package can take that long to arrive. |
+| **Run schedule** | Once delivered, the assignment's schedule (hourly here) governs how often detection runs. |
+
+So expect up to ~8 hours for first contact, not one hour. A restart or user sign-in pulls
+it sooner, as does **Sync** from the portal or Company Portal.
+
+The first remediation run installs the watchdog; the watchdog then starts in every
+signed-in session within 30 minutes, and at every logon after that.
 
 ### Verifying the rollout
 
