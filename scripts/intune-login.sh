@@ -34,7 +34,9 @@ usage() {
   cat <<'USAGE'
 Usage: intune-login.sh [options]
 
-  --account <upn>     Account to sign in with, e.g. intune-admin@contoso.com.
+  --account <upn>     Account you intend to sign in as, e.g. intune-admin@contoso.com.
+                      Verified after login (there is no account hint for interactive
+                      auth); the login is rejected if a different account comes back.
   --tenant <id>       Tenant id or domain. Optional; defaults to the account's home tenant.
   --profile <dir>     Azure CLI profile directory. Default: ~/.azure-intune
   --device-code       Use device-code flow instead of opening a browser.
@@ -94,9 +96,15 @@ esac
 mkdir -p "$PROFILE_DIR"
 chmod 700 "$PROFILE_DIR"
 
-# --allow-no-subscriptions matters: an Intune-only admin account frequently has no
-# Azure subscription, and without this az treats the login as a failure.
-LOGIN_ARGS=(login --allow-no-subscriptions --username "$ACCOUNT" --only-show-errors)
+# Interactive login only.
+#
+#   * --allow-no-subscriptions: an Intune-only admin account frequently has no Azure
+#     subscription, and without this az treats the login as a failure.
+#   * NO --username. Passing it puts az into resource-owner-password mode, which
+#     prompts for a password and CANNOT satisfy MFA (AADSTS50076). There is no account
+#     hint for the interactive flow, so $ACCOUNT is treated as the account to VERIFY
+#     afterwards rather than a hint to pass in.
+LOGIN_ARGS=(login --allow-no-subscriptions --only-show-errors)
 if [[ -n "$TENANT" ]]; then
   LOGIN_ARGS+=(--tenant "$TENANT")
 fi
@@ -104,14 +112,25 @@ if (( DEVICE_CODE )); then
   LOGIN_ARGS+=(--use-device-code)
 fi
 
-graph_info "signing in as ${ACCOUNT} into profile ${PROFILE_DIR}"
+graph_info "signing in to profile ${PROFILE_DIR}"
+if (( DEVICE_CODE )); then
+  graph_info "follow the device-code prompt below and sign in as: ${ACCOUNT}"
+else
+  graph_info "a browser will open - sign in as: ${ACCOUNT}"
+  graph_info "if it signs you in silently as a different account, re-run with --device-code"
+fi
+
 graph_az "${LOGIN_ARGS[@]}" >/dev/null || graph_die "az login failed"
 
 SIGNED_IN="$(graph_az account show --query user.name -o tsv 2>/dev/null || true)"
 [[ -n "$SIGNED_IN" ]] || graph_die "login appeared to succeed but the profile has no active account"
 
 if [[ "${SIGNED_IN:l}" != "${ACCOUNT:l}" ]]; then
-  graph_die "signed in as ${SIGNED_IN}, not ${ACCOUNT}. Sign out of the browser session and retry, or use --device-code."
+  # The browser reused an existing session for the wrong identity. Drop it from THIS
+  # profile only - the caller's default az session is in a different directory and is
+  # not touched.
+  graph_az logout 2>/dev/null || true
+  graph_die "signed in as ${SIGNED_IN}, not ${ACCOUNT}. The browser reused an existing session; re-run with --device-code, or use a private browser window."
 fi
 
 # Prove the account can actually get a Graph token with usable scopes before
