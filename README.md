@@ -206,6 +206,7 @@ scripts/
   update-intune.sh                         push a new payload version
   teardown-intune.sh                       deploy the removal remediation, then delete
   lib/graph.sh                             Microsoft Graph auth + request helpers
+diagnostics/probe/                         no-privilege scripts for "package won't save" triage
 tests/                                     Pester 5 suite + Windows-cmdlet shims
   clm/                                     runs the payload in a real constrained runspace
 build/                                     generated - what you upload to Intune
@@ -330,7 +331,10 @@ Microsoft lists Remediations as a feature requiring this attestation, and it def
 licenses to individual devices". An **Intune Service Administrator** must set it before
 Remediations is used for the first time.
 
-If assignment fails in the portal and nothing else here is wrong, check this first.
+If assignment fails in the portal and nothing else here is wrong, check this first. If
+the cause still isn't clear, [`diagnostics/probe/`](diagnostics/probe/README.md) has
+no-privilege test scripts and a decision table that pin down which prerequisite is
+blocking you.
 
 ### 2. Device-user licensing
 
